@@ -7,14 +7,14 @@ pd.set_option("styler.render.max_elements", 5_000_000)
 
 st.set_page_config(
     page_title="Kardex Viewer",
-    page_icon="🌽",
+    page_icon="assets/icono.ico",
     layout="wide"
 )
 
 st.markdown("""
 <style>
     .main-header {
-        background: linear-gradient(90deg, #f5a623, #f0c040);
+        background: linear-gradient(90deg, #1e24a8, #343552);
         padding: 1.2rem 2rem;
         border-radius: 10px;
         margin-bottom: 1.5rem;
@@ -23,10 +23,10 @@ st.markdown("""
     .section-title {
         font-size: 1.05rem;
         font-weight: 700;
-        color: #e65100;
+        color: #3439c9;
         margin-top: 1.2rem;
         margin-bottom: 0.5rem;
-        border-bottom: 2px solid #ffe0b2;
+        border-bottom: 2px solid #3439c9;
         padding-bottom: 4px;
     }
     div[data-testid="metric-container"] {
@@ -48,7 +48,7 @@ st.markdown("""
 
 st.markdown("""
 <div class="main-header">
-    <h2 style='margin:0;'>🌽 Kardex Viewer — Inventario</h2>
+    <h2 style='margin:0;'>📊 Kardex Viewer — Inventario</h2>
     <p style='margin:4px 0 0 0; font-size:0.9rem; opacity:0.85;'>Visualizador de movimientos · Soporta múltiples archivos</p>
 </div>
 """, unsafe_allow_html=True)
@@ -324,7 +324,7 @@ else:
 # ── Badges de productos visibles ──────────────────────────────────────────────
 productos_visibles = df_all[["Codigo","Descripcion"]].drop_duplicates()
 badges = " ".join([
-    f'<span style="display:inline-block;background:#fff3e0;border:1px solid #f5a623;border-radius:20px;padding:0.2rem 0.9rem;font-size:0.85rem;color:#e65100;font-weight:600;margin-right:0.4rem;">📦 {r.Codigo} — {r.Descripcion}</span>'
+    f'<span style="display:inline-block;background:#e4e6f2;border:1px solid #1e24a8;border-radius:20px;padding:0.2rem 0.9rem;font-size:0.85rem;color:#1e24a8;font-weight:600;margin-right:0.4rem;">📦 {r.Codigo} — {r.Descripcion}</span>'
     for r in productos_visibles.itertuples()
 ])
 st.markdown(f'<div style="margin-bottom:1rem;">{badges}</div>', unsafe_allow_html=True)
