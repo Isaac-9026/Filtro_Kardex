@@ -55,19 +55,18 @@ st.markdown("""
 
 
 # ── Parser ───────────────────────────────────────────────────────────────────
-COLUMNAS_REQUERIDAS = 16
+COLUMNAS_REQUERIDAS = 15
 
 @st.cache_data
 def load_kardex(file_bytes, filename):
     try:
         df = pd.read_excel(file_bytes, header=1)
 
-        # Validar cantidad de columnas
         if df.shape[1] < COLUMNAS_REQUERIDAS:
             return None, f"❌ '{filename}' no tiene el formato esperado ({df.shape[1]} columnas encontradas, se esperan {COLUMNAS_REQUERIDAS})."
 
         df.columns = [
-            "Codigo", "Descripcion",
+            "Codigo",
             "Fecha", "Tipo", "Serie", "Numero", "Tipo_Operacion",
             "Ent_Cantidad", "Ent_Costo_Unit", "Ent_Costo_Total",
             "Sal_Cantidad", "Sal_Costo_Unit", "Sal_Costo_Total",
@@ -84,12 +83,16 @@ def load_kardex(file_bytes, filename):
         for col in cols_numericas:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).round(10)
 
-        df["Codigo"]      = df["Codigo"].ffill().astype(str).str.strip()
-        df["Descripcion"] = df["Descripcion"].ffill().astype(str).str.strip()
+        df["Codigo"] = df["Codigo"].ffill().astype(str).str.strip()
 
-        # Validar que haya datos reales
-        if df["Fecha"].isna().all():
+        # FIX 2: eliminar filas sin fecha válida (filas basura o vacías)
+        df = df[df["Fecha"].notna()].reset_index(drop=True)
+
+        if len(df) == 0:
             return None, f"❌ '{filename}' no contiene fechas válidas. Verifica que el archivo sea un Kardex correcto."
+
+        # FIX 5: proteger columna Tipo contra NaN o string vacío
+        df["Tipo"] = pd.to_numeric(df["Tipo"], errors="coerce").fillna(0).astype(int)
 
         return df, None
 
@@ -98,23 +101,25 @@ def load_kardex(file_bytes, filename):
 
 
 def render_metricas(dff):
-    saldo_rows        = dff[dff["Saldo_Cantidad"] > 0]
-    saldo_final_cant  = saldo_rows["Saldo_Cantidad"].iloc[-1]    if len(saldo_rows) else 0
-    saldo_final_valor = saldo_rows["Saldo_Costo_Total"].iloc[-1] if len(saldo_rows) else 0
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("📥 Ent. Cantidad",  f"{dff['Ent_Cantidad'].sum():,.3f} kg")
-    m2.metric("📥 Ent. Valor",     f"S/ {dff['Ent_Costo_Total'].sum():,.2f}")
-    m3.metric("📤 Sal. Cantidad",  f"{dff['Sal_Cantidad'].sum():,.3f} kg")
-    m4.metric("📤 Sal. Valor",     f"S/ {dff['Sal_Costo_Total'].sum():,.2f}")
-    m5.metric("📦 Saldo Final Kg", f"{saldo_final_cant:,.3f} kg")
-    m6.metric("💰 Saldo Final S/", f"S/ {saldo_final_valor:,.2f}")  # ← corregido a 2 decimales
+    saldo_final_cant  = dff["Saldo_Cantidad"].iloc[-1]    if len(dff) else 0
+    saldo_final_valor = dff["Saldo_Costo_Total"].iloc[-1] if len(dff) else 0
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Cantidad ENTRADA total", f"{dff['Ent_Cantidad'].sum():,.3f} kg")
+    m2.metric("Costo ENTRADA total",    f"S/ {dff['Ent_Costo_Total'].sum():,.2f}")
+    m3.metric("Cantidad SALIDA total",  f"{dff['Sal_Cantidad'].sum():,.3f} kg")
+
+    m4, m5, m6 = st.columns(3)
+    m4.metric("Costo SALIDA total",   f"S/ {dff['Sal_Costo_Total'].sum():,.2f}")
+    m5.metric("Cantidad SALDO total", f"{saldo_final_cant:,.3f} kg")
+    m6.metric("Costo SALDO total",    f"S/ {saldo_final_valor:,.2f}")
 
 
 def render_tabla(dff):
     display = dff.copy()
     display["Fecha"] = display["Fecha"].dt.strftime("%d/%m/%Y").fillna("")
     display = display.rename(columns={
-        "Codigo":"Código", "Descripcion":"Descripción",
+        "Codigo":"Código",
         "Fecha":"Fecha", "Tipo":"Tipo", "Serie":"Serie",
         "Numero":"Número", "Tipo_Operacion":"Operación",
         "Ent_Cantidad":"Ent. Cant.", "Ent_Costo_Unit":"Ent. C.Unit",
@@ -131,7 +136,6 @@ def render_tabla(dff):
     st.dataframe(display.style.format(fmt), use_container_width=True, height=600)
 
 
-
 def exportar_excel(df):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -143,19 +147,18 @@ def exportar_excel(df):
 
     headers_grupo = [
         ("Código",            1, 1),
-        ("Descripción",       2, 2),
-        ("COMPROBANTE",       3, 6),
-        ("Tipo de Operación", 7, 7),
-        ("ENTRADAS",          8, 10),
-        ("SALIDAS",           11, 13),
-        ("SALDO FINAL",       14, 16),
+        ("COMPROBANTE",       2, 5),
+        ("Tipo de Operación", 6, 6),
+        ("ENTRADAS",          7, 9),
+        ("SALIDAS",           10, 12),
+        ("SALDO FINAL",       13, 15),
     ]
 
-    sin_fill  = PatternFill(fill_type=None)
-    bold      = Font(bold=True)
-    center    = Alignment(horizontal="center", vertical="center")
-    thin      = Side(style="thin")
-    borde     = Border(left=thin, right=thin, top=thin, bottom=thin)
+    sin_fill = PatternFill(fill_type=None)
+    bold     = Font(bold=True)
+    center   = Alignment(horizontal="center", vertical="center")
+    thin     = Side(style="thin")
+    borde    = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     for (titulo, col_ini, col_fin) in headers_grupo:
         cell = ws.cell(row=1, column=col_ini, value=titulo)
@@ -170,7 +173,7 @@ def exportar_excel(df):
             ws.cell(row=2, column=col_ini).border = borde
 
     subheaders = [
-        "Código", "Descripción",
+        "Código",
         "Fecha", "Tipo", "Serie", "Número", "Tipo de Operación",
         "Cantidad", "Costo Unitario", "Costo Total",
         "Cantidad", "Costo Unitario", "Costo Total",
@@ -178,7 +181,7 @@ def exportar_excel(df):
     ]
 
     for col, sh in enumerate(subheaders, start=1):
-        if col in (1, 2, 7):
+        if col in (1, 6):
             continue
         cell = ws.cell(row=2, column=col, value=sh)
         cell.font      = bold
@@ -186,31 +189,36 @@ def exportar_excel(df):
         cell.fill      = sin_fill
         cell.border    = borde
 
-    cols_centradas = {3, 4, 5, 6, 7}
+    cols_centradas = {2, 3, 4, 5, 6}
+
+    # FIX 4: zfill dinámico según el largo máximo real de los códigos
+    max_len = df["Codigo"].astype(str).str.len().max()
 
     for row_idx, row in enumerate(df.itertuples(index=False), start=3):
         datos = [
-            (str(row.Codigo).zfill(6), "@"),
-            (row.Descripcion,          "@"),
+            (str(row.Codigo).zfill(max_len),  "@"),
             (row.Fecha.strftime("%d/%m/%Y") if pd.notna(row.Fecha) else "", "@"),
-            (row.Tipo,                 "00"),
-            (str(row.Serie),           "@"),
+            # FIX 5: Tipo ya viene como int desde el parser
+            (row.Tipo, "00"),
+            (str(row.Serie), "@"),
             (int(row.Numero) if str(row.Numero).strip() not in ("", "nan") else 0, r'[$-408]00000000'),
-            (row.Tipo_Operacion,       "@"),
-            (row.Ent_Cantidad,         "#,##0.000"),
-            (row.Ent_Costo_Unit,       "#,##0.0000"),
-            (row.Ent_Costo_Total,      "#,##0.000"),
-            (row.Sal_Cantidad,         "#,##0.000"),
-            (row.Sal_Costo_Unit,       "#,##0.0000"),
-            (row.Sal_Costo_Total,      "#,##0.000"),
-            (row.Saldo_Cantidad,       "#,##0.000"),
-            (row.Saldo_Costo_Unit,     "#,##0.0000"),
-            (row.Saldo_Costo_Total,    "#,##0.000"),
+            (row.Tipo_Operacion, "@"),
+            (row.Ent_Cantidad,      "#,##0.000"),
+            (row.Ent_Costo_Unit,    "#,##0.0000"),
+            (row.Ent_Costo_Total,   "#,##0.000"),
+            (row.Sal_Cantidad,      "#,##0.000"),
+            (row.Sal_Costo_Unit,    "#,##0.0000"),
+            (row.Sal_Costo_Total,   "#,##0.000"),
+            (row.Saldo_Cantidad,    "#,##0.000"),
+            (row.Saldo_Costo_Unit,  "#,##0.0000"),
+            (row.Saldo_Costo_Total, "#,##0.000"),
         ]
         for col, (val, fmt_num) in enumerate(datos, start=1):
             cell = ws.cell(row=row_idx, column=col, value=val)
             if col == 1:
-                cell.data_type = "s"
+                cell.value        = str(val)
+                cell.data_type    = "s"
+                cell.quotePrefix  = True  # fuerza apóstrofo → Excel trata la celda como texto
             cell.number_format = fmt_num
             cell.border        = borde
             cell.alignment     = Alignment(
@@ -218,7 +226,7 @@ def exportar_excel(df):
                 vertical="center"
             )
 
-    anchos = [10, 22, 12, 6, 8, 14, 18, 12, 14, 16, 12, 14, 16, 12, 14, 16]
+    anchos = [10, 12, 6, 8, 14, 18, 12, 14, 16, 12, 14, 16, 12, 14, 16]
     for i, ancho in enumerate(anchos, start=1):
         ws.column_dimensions[get_column_letter(i)].width = ancho
 
@@ -260,7 +268,6 @@ for f in uploaded_files:
     else:
         frames[f.name] = df_temp
 
-# Mostrar errores si los hay
 if errores:
     for err in errores:
         st.markdown(f'<div class="error-box">{err}</div>', unsafe_allow_html=True)
@@ -271,23 +278,40 @@ if not frames:
 
 df_all = pd.concat(frames.values(), ignore_index=True)
 
-# ── Filtro por producto ───────────────────────────────────────────────────────
-st.markdown('<div class="section-title">📦 Filtro por Producto</div>', unsafe_allow_html=True)
+# FIX 6: ordenar cronológicamente por Codigo y Fecha
+df_all = df_all.sort_values(["Codigo", "Fecha"], na_position="first").reset_index(drop=True)
 
-productos_disponibles = df_all[["Codigo", "Descripcion"]].drop_duplicates()
-opciones_producto = ["Todos"] + [
-    f"{r.Codigo} — {r.Descripcion}" for r in productos_disponibles.itertuples()
-]
-producto_sel = st.selectbox("Producto", opciones_producto)
+# ── Filtro por código ─────────────────────────────────────────────────────────
+st.markdown('<div class="section-title">📦 Filtro por Código</div>', unsafe_allow_html=True)
 
-if producto_sel != "Todos":
-    codigo_sel = producto_sel.split(" — ")[0].strip()
-    df_all = df_all[df_all["Codigo"] == codigo_sel]
+codigos_disponibles = sorted(df_all["Codigo"].dropna().unique().tolist())
+
+col_id1, col_id2 = st.columns([3, 1])
+with col_id1:
+    id_buscado = st.text_input(
+        "Ingresa el código del producto",
+        placeholder="Ej: 021007",
+        help="Escribe el código exacto para filtrar"
+    )
+with col_id2:
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.button("🔍 Buscar", use_container_width=True)
+
+if id_buscado.strip():
+    # FIX 3: comparar con zfill para evitar discrepancias de ceros
+    buscado_norm = id_buscado.strip().zfill(6)
+    coincidencias = [c for c in codigos_disponibles if c.zfill(6) == buscado_norm]
+    if coincidencias:
+        df_all = df_all[df_all["Codigo"].isin(coincidencias)]
+    else:
+        st.warning(f"⚠️ No se encontró ningún producto con el código '{id_buscado.strip()}'.")
 
 # ── Filtro de fecha ───────────────────────────────────────────────────────────
 st.markdown('<div class="section-title">📅 Filtro por Fecha</div>', unsafe_allow_html=True)
 
 fechas_validas = df_all["Fecha"].dropna()
+f_min = fechas_validas.min().date()
+f_max = fechas_validas.max().date()
 años_disponibles = sorted(fechas_validas.dt.year.unique().tolist())
 meses_nombres = {
     1:"Enero", 2:"Febrero", 3:"Marzo", 4:"Abril",
@@ -295,37 +319,64 @@ meses_nombres = {
     9:"Septiembre", 10:"Octubre", 11:"Noviembre", 12:"Diciembre"
 }
 
-col_a, col_m = st.columns(2)
-with col_a:
-    año_sel = st.selectbox("Año", ["Todos"] + años_disponibles)
-with col_m:
-    if año_sel == "Todos":
-        st.selectbox("Mes", ["Todos"], disabled=True)
-        mes_sel = "Todos"
-    else:
-        meses_en_año = sorted(
-            fechas_validas[fechas_validas.dt.year == año_sel].dt.month.unique().tolist()
-        )
-        opciones_mes = ["Todos"] + [meses_nombres[m] for m in meses_en_año]
-        mes_label = st.selectbox("Mes", opciones_mes)
-        mes_sel = next((k for k, v in meses_nombres.items() if v == mes_label), "Todos")
+tipo_filtro = st.radio(
+    "Modo de filtro",
+    ["Por Año / Mes", "Por fecha exacta", "Por rango de fechas"],
+    horizontal=True
+)
 
-# Aplicar filtro fecha
-if año_sel == "Todos":
-    pass
-elif mes_sel == "Todos":
-    df_all = df_all[(df_all["Fecha"].isna()) | (df_all["Fecha"].dt.year == año_sel)]
-else:
+if tipo_filtro == "Por Año / Mes":
+    col_a, col_m = st.columns(2)
+    with col_a:
+        año_sel = st.selectbox("Año", ["Todos"] + años_disponibles)
+    with col_m:
+        if año_sel == "Todos":
+            st.selectbox("Mes", ["Todos"], disabled=True)
+            mes_sel = "Todos"
+        else:
+            meses_en_año = sorted(
+                fechas_validas[fechas_validas.dt.year == año_sel].dt.month.unique().tolist()
+            )
+            opciones_mes = ["Todos"] + [meses_nombres[m] for m in meses_en_año]
+            mes_label = st.selectbox("Mes", opciones_mes)
+            mes_sel = next((k for k, v in meses_nombres.items() if v == mes_label), "Todos")
+
+    if año_sel == "Todos":
+        pass
+    elif mes_sel == "Todos":
+        df_all = df_all[(df_all["Fecha"].isna()) | (df_all["Fecha"].dt.year == año_sel)]
+    else:
+        df_all = df_all[
+            (df_all["Fecha"].isna()) |
+            ((df_all["Fecha"].dt.year == año_sel) & (df_all["Fecha"].dt.month == mes_sel))
+        ]
+
+elif tipo_filtro == "Por fecha exacta":
+    fecha_exacta = st.date_input("Selecciona una fecha", value=f_max, min_value=f_min, max_value=f_max)
     df_all = df_all[
         (df_all["Fecha"].isna()) |
-        ((df_all["Fecha"].dt.year == año_sel) & (df_all["Fecha"].dt.month == mes_sel))
+        (df_all["Fecha"].dt.date == fecha_exacta)
     ]
 
-# ── Badges de productos visibles ──────────────────────────────────────────────
-productos_visibles = df_all[["Codigo","Descripcion"]].drop_duplicates()
+elif tipo_filtro == "Por rango de fechas":
+    col_r1, col_r2 = st.columns(2)
+    with col_r1:
+        fecha_desde = st.date_input("Desde", value=f_min, min_value=f_min, max_value=f_max)
+    with col_r2:
+        fecha_hasta = st.date_input("Hasta", value=f_max, min_value=f_min, max_value=f_max)
+    if fecha_desde <= fecha_hasta:
+        df_all = df_all[
+            (df_all["Fecha"].isna()) |
+            ((df_all["Fecha"].dt.date >= fecha_desde) & (df_all["Fecha"].dt.date <= fecha_hasta))
+        ]
+    else:
+        st.warning("⚠️ La fecha de inicio no puede ser mayor a la fecha final.")
+
+# ── Badges de códigos visibles ────────────────────────────────────────────────
+codigos_visibles = df_all["Codigo"].drop_duplicates().tolist()
 badges = " ".join([
-    f'<span style="display:inline-block;background:#e4e6f2;border:1px solid #1e24a8;border-radius:20px;padding:0.2rem 0.9rem;font-size:0.85rem;color:#1e24a8;font-weight:600;margin-right:0.4rem;">📦 {r.Codigo} — {r.Descripcion}</span>'
-    for r in productos_visibles.itertuples()
+    f'<span style="display:inline-block;background:#e4e6f2;border:1px solid #1e24a8;border-radius:20px;padding:0.2rem 0.9rem;font-size:0.85rem;color:#1e24a8;font-weight:600;margin-right:0.4rem;">📦 {c}</span>'
+    for c in codigos_visibles
 ])
 st.markdown(f'<div style="margin-bottom:1rem;">{badges}</div>', unsafe_allow_html=True)
 
@@ -338,8 +389,8 @@ st.markdown(
 render_metricas(df_all)
 render_tabla(df_all)
 
-# ── Descargar Excel filtrado ──────────────────────────────────────────────────
-st.markdown('<div class="section-title">💾 Descargar datos filtrados</div>', unsafe_allow_html=True)
+# ── Descargar Excel ───────────────────────────────────────────────────────────
+st.markdown('<div class="section-title">💾 Descargar datos</div>', unsafe_allow_html=True)
 
 buffer = exportar_excel(df_all)
 
