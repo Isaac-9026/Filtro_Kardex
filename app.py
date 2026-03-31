@@ -94,10 +94,13 @@ def load_kardex(file_bytes, filename):
         cols_numericas = [
             "Ent_Cantidad","Ent_Costo_Unit","Ent_Costo_Total",
             "Sal_Cantidad","Sal_Costo_Unit","Sal_Costo_Total",
-            "Saldo_Cantidad","Saldo_Costo_Unit","Saldo_Costo_Total"
+            "Saldo_Cantidad","Saldo_Costo_Unit"
         ]
         for col in cols_numericas:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).round(10)
+
+        # Saldo_Costo_Total: NO rellenar con 0 — NaN se trata como vacío real
+        df["Saldo_Costo_Total"] = pd.to_numeric(df["Saldo_Costo_Total"], errors="coerce").round(10)
 
         df["Codigo"] = df["Codigo"].ffill().astype(str).str.strip()
         df = df[df["Fecha"].notna()].reset_index(drop=True)
@@ -116,45 +119,67 @@ def load_kardex(file_bytes, filename):
 # ── Verificación de Saldo Costo Total ────────────────────────────────────────
 def verificar_saldo_costo_total(df, tolerancia=0.01):
     """
-    Verifica fila por fila comparando con la fila anterior:
-        Saldo[i] == Saldo[i-1] + Entrada[i] - Salida[i]
-    Un error en una fila no contamina las siguientes.
-    La fila de 'Saldo Anterior' se acepta como válida y sirve de base.
+    Pasada 1 — Detección (usa Excel como base → no arrastra falsos positivos)
+    Pasada 2 — Corrección (usa calculado como base → corrige en cascada correctamente)
     """
     df = df.copy()
     df["Saldo_Calculado"] = 0.0
     df["Diferencia"]      = 0.0
     df["Alterado"]        = False
+    df["Completado"]      = False
 
     for codigo in df["Codigo"].unique():
         mask    = df["Codigo"] == codigo
-        indices = df[mask].index
-        saldo_anterior = None
+        indices = list(df[mask].index)
 
+        # ── Pasada 1: Detección (base = valor Excel → no arrastra error) ──────
+        saldo_anterior = None
         for idx in indices:
-            op = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
+            op          = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
             saldo_excel = df.at[idx, "Saldo_Costo_Total"]
 
-            # Saldo Anterior: aceptar directamente como base
             if "saldo anterior" in op or saldo_anterior is None:
-                df.at[idx, "Saldo_Calculado"] = saldo_excel
-                df.at[idx, "Diferencia"]      = 0.0
-                df.at[idx, "Alterado"]        = False
-                saldo_anterior = saldo_excel
+                base = saldo_excel if pd.notna(saldo_excel) else 0.0
+                df.at[idx, "Saldo_Calculado"] = base
+                saldo_anterior = base
                 continue
 
-            # Calcular lo esperado usando el saldo de la fila anterior del Excel
             esperado = round(
                 saldo_anterior + df.at[idx, "Ent_Costo_Total"] - df.at[idx, "Sal_Costo_Total"], 10
             )
-            diff = round(abs(esperado - saldo_excel), 10)
-
             df.at[idx, "Saldo_Calculado"] = esperado
-            df.at[idx, "Diferencia"]      = diff
-            df.at[idx, "Alterado"]        = diff > tolerancia
 
-            # Siempre usar el valor del Excel como base para la siguiente fila
-            saldo_anterior = saldo_excel
+            if pd.isna(saldo_excel):
+                df.at[idx, "Completado"] = True
+                saldo_anterior = esperado
+                continue
+
+            diff = round(abs(esperado - saldo_excel), 10)
+            df.at[idx, "Diferencia"] = diff
+            df.at[idx, "Alterado"]   = diff > tolerancia
+            saldo_anterior = saldo_excel  # usar Excel → no arrastra error
+
+        # ── Pasada 2: Corrección (base = calculado → corrige en cascada) ──────
+        saldo_anterior = None
+        for idx in indices:
+            op          = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
+            saldo_excel = df.at[idx, "Saldo_Costo_Total"]
+
+            if "saldo anterior" in op or saldo_anterior is None:
+                saldo_anterior = saldo_excel if pd.notna(saldo_excel) else 0.0
+                continue
+
+            esperado = round(
+                saldo_anterior + df.at[idx, "Ent_Costo_Total"] - df.at[idx, "Sal_Costo_Total"], 10
+            )
+            # Siempre corregir con el calculado
+            df.at[idx, "Saldo_Calculado"] = esperado
+            saldo_anterior = esperado  # usar calculado → corrección en cascada
+
+            # Si estaba vacío, completar también el valor original
+            if pd.isna(saldo_excel):
+                df.at[idx, "Saldo_Costo_Total"] = esperado
+                df.at[idx, "Completado"]         = True
 
     return df
 
@@ -192,31 +217,34 @@ def render_tabla(dff, mostrar_verificacion=False):
     fmt = {
         "Ent. Cant.":"{:,.3f}", "Ent. C.Unit":"{:,.5f}", "Ent. C.Total":"{:,.2f}",
         "Sal. Cant.":"{:,.3f}", "Sal. C.Unit":"{:,.5f}", "Sal. C.Total":"{:,.2f}",
-        "Saldo Cant.":"{:,.3f}", "Saldo C.Unit":"{:,.5f}", "Saldo C.Total":"{:,.2f}",
+        "Saldo Cant.":"{:,.3f}", "Saldo C.Unit":"{:,.5f}",
+        "Saldo C.Total": lambda x: f"{x:,.2f}" if pd.notna(x) else "",
     }
 
     if mostrar_verificacion and "Alterado" in display.columns:
-        # Añadir columnas de verificación visibles
         display["Saldo Calculado"] = display["Saldo_Calculado"]
         display["Diferencia"]      = display["Diferencia"]
         alterado_mask              = display["Alterado"].values
-        display = display.drop(columns=["Saldo_Calculado", "Alterado"])
+        completado_mask            = display["Completado"].values if "Completado" in display.columns else [False] * len(display)
+        display = display.drop(columns=["Saldo_Calculado", "Alterado", "Completado"], errors="ignore")
         display = display.rename(columns=cols_rename)
         fmt["Saldo Calculado"] = "{:,.2f}"
         fmt["Diferencia"]      = "{:,.4f}"
 
-        def highlight_alterado(row):
+        def highlight_filas(row):
             idx = display.index.get_loc(row.name)
             if alterado_mask[idx]:
                 return ["background-color: #ffebee; color: #b71c1c"] * len(row)
+            if completado_mask[idx]:
+                return ["background-color: #e3f2fd; color: #1565c0"] * len(row)
             return [""] * len(row)
 
         st.dataframe(
-            display.style.format(fmt).apply(highlight_alterado, axis=1),
+            display.style.format(fmt).apply(highlight_filas, axis=1),
             use_container_width=True, height=600
         )
     else:
-        display = display.drop(columns=["Saldo_Calculado", "Diferencia", "Alterado"],
+        display = display.drop(columns=["Saldo_Calculado", "Diferencia", "Alterado", "Completado"],
                                errors="ignore")
         display = display.rename(columns=cols_rename)
         st.dataframe(display.style.format(fmt), use_container_width=True, height=600)
@@ -293,14 +321,14 @@ def exportar_excel(df):
             (row.Sal_Costo_Total,   "#,##0.000"),
             (row.Saldo_Cantidad,    "#,##0.000"),
             (row.Saldo_Costo_Unit,  "#,##0.0000"),
-            (row.Saldo_Costo_Total, "#,##0.000"),
+            (row.Saldo_Costo_Total if pd.notna(row.Saldo_Costo_Total) else "", "#,##0.000"),
         ]
         for col, (val, fmt_num) in enumerate(datos, start=1):
             cell = ws.cell(row=row_idx, column=col)
             if col == 1:
-                cell.value        = str(val)
+                cell.value         = str(val)
                 cell.number_format = "@"
-                cell.quotePrefix  = True
+                cell.quotePrefix   = True
             else:
                 cell.value         = val
                 cell.number_format = fmt_num
@@ -478,13 +506,18 @@ badges = " ".join([
 st.markdown(f'<div style="margin-bottom:1rem;">{badges}</div>', unsafe_allow_html=True)
 
 # ── Alerta de integridad ──────────────────────────────────────────────────────
-n_alterados = df_all["Alterado"].sum()
-if n_alterados > 0:
+n_alterados  = df_all["Alterado"].sum()
+n_completados = df_all["Completado"].sum() if "Completado" in df_all.columns else 0
+
+if n_alterados > 0 or n_completados > 0:
+    msgs = []
+    if n_alterados > 0:
+        msgs.append(f"<strong>{n_alterados} fila(s) con valor incorrecto</strong> (marcadas en 🔴 rojo)")
+    if n_completados > 0:
+        msgs.append(f"<strong>{n_completados} fila(s) con valor vacío completadas automáticamente</strong> (marcadas en 🔵 azul)")
     st.markdown(
-        f'<div class="alert-box">⚠️ Se detectaron <strong>{n_alterados} fila(s)</strong> donde el '
-        f'Costo Total del Saldo Final en el Excel <strong>no coincide</strong> con el valor recalculado por el programa. '
-        f'Esto puede deberse a un error en el sistema de origen o a una posible alteración. '
-        f'Activa <strong>"Mostrar verificación"</strong> para ver el detalle fila por fila.</div>',
+        f'<div class="alert-box">⚠️ Se detectaron: {" y ".join(msgs)}. '
+        f'Activa <strong>"Mostrar verificación"</strong> para ver el detalle.</div>',
         unsafe_allow_html=True
     )
 else:
@@ -507,11 +540,10 @@ render_tabla(df_all, mostrar_verificacion=mostrar_ver)
 # ── Descargar Excel ───────────────────────────────────────────────────────────
 st.markdown('<div class="section-title">💾 Descargar datos</div>', unsafe_allow_html=True)
 
-# Exportar con Saldo_Costo_Total corregido donde haya diferencia
 df_export = df_all.copy()
 if "Saldo_Calculado" in df_export.columns:
     df_export["Saldo_Costo_Total"] = df_export["Saldo_Calculado"]
-df_export = df_export.drop(columns=["Saldo_Calculado", "Diferencia", "Alterado"], errors="ignore")
+df_export = df_export.drop(columns=["Saldo_Calculado", "Diferencia", "Alterado", "Completado"], errors="ignore")
 buffer = exportar_excel(df_export)
 
 nombre_personalizado = st.text_input(
