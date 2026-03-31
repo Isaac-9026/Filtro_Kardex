@@ -119,20 +119,56 @@ def load_kardex(file_bytes, filename):
 # ── Verificación de Saldo Costo Total ────────────────────────────────────────
 def verificar_saldo_costo_total(df, tolerancia=0.01):
     """
-    Pasada 1 — Detección (usa Excel como base → no arrastra falsos positivos)
-    Pasada 2 — Corrección (usa calculado como base → corrige en cascada correctamente)
+    Verificación completa con semáforo por fila:
+    - Ent_Costo_Total = Ent_Cantidad × Ent_Costo_Unit
+    - Sal_Costo_Total = Sal_Cantidad × Sal_Costo_Unit
+    - Saldo_Costo_Total = Saldo_anterior + Ent_Costo_Total - Sal_Costo_Total
+
+    Semáforo:
+    🟢 Correcto
+    🔵 Completado (vacío rellenado)
+    🟡 Ent o Sal Costo_Total inconsistente
+    🔴 Saldo_Costo_Total incorrecto
+    ⚫ Múltiples campos con problemas
     """
     df = df.copy()
-    df["Saldo_Calculado"] = 0.0
-    df["Diferencia"]      = 0.0
-    df["Alterado"]        = False
-    df["Completado"]      = False
+    df["Saldo_Calculado"]   = 0.0
+    df["Diferencia"]        = 0.0
+    df["Alterado"]          = False
+    df["Completado"]        = False
+    df["Error_Ent"]         = False
+    df["Error_Sal"]         = False
+    df["Semaforo"]          = "🟢"
 
     for codigo in df["Codigo"].unique():
         mask    = df["Codigo"] == codigo
         indices = list(df[mask].index)
 
-        # ── Pasada 1: Detección (base = valor Excel → no arrastra error) ──────
+        # ── Verificar Ent_Costo_Total y Sal_Costo_Total ───────────────────────
+        for idx in indices:
+            op = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
+            if "saldo anterior" in op:
+                continue
+
+            ent_cant  = df.at[idx, "Ent_Cantidad"]
+            ent_unit  = df.at[idx, "Ent_Costo_Unit"]
+            ent_total = df.at[idx, "Ent_Costo_Total"]
+            sal_cant  = df.at[idx, "Sal_Cantidad"]
+            sal_unit  = df.at[idx, "Sal_Costo_Unit"]
+            sal_total = df.at[idx, "Sal_Costo_Total"]
+
+            # Solo verificar si hay movimiento (cant > 0 y unit > 0)
+            if ent_cant > 0 and ent_unit > 0:
+                ent_esperado = round(ent_cant * ent_unit, 10)
+                if round(abs(ent_esperado - ent_total), 10) > tolerancia:
+                    df.at[idx, "Error_Ent"] = True
+
+            if sal_cant > 0 and sal_unit > 0:
+                sal_esperado = round(sal_cant * sal_unit, 10)
+                if round(abs(sal_esperado - sal_total), 10) > tolerancia:
+                    df.at[idx, "Error_Sal"] = True
+
+        # ── Pasada 1: Detección de Saldo (base = Excel → no arrastra error) ───
         saldo_anterior = None
         for idx in indices:
             op          = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
@@ -157,7 +193,7 @@ def verificar_saldo_costo_total(df, tolerancia=0.01):
             diff = round(abs(esperado - saldo_excel), 10)
             df.at[idx, "Diferencia"] = diff
             df.at[idx, "Alterado"]   = diff > tolerancia
-            saldo_anterior = saldo_excel  # usar Excel → no arrastra error
+            saldo_anterior = saldo_excel
 
         # ── Pasada 2: Corrección (base = calculado → corrige en cascada) ──────
         saldo_anterior = None
@@ -172,14 +208,37 @@ def verificar_saldo_costo_total(df, tolerancia=0.01):
             esperado = round(
                 saldo_anterior + df.at[idx, "Ent_Costo_Total"] - df.at[idx, "Sal_Costo_Total"], 10
             )
-            # Siempre corregir con el calculado
             df.at[idx, "Saldo_Calculado"] = esperado
-            saldo_anterior = esperado  # usar calculado → corrección en cascada
+            saldo_anterior = esperado
 
-            # Si estaba vacío, completar también el valor original
             if pd.isna(saldo_excel):
                 df.at[idx, "Saldo_Costo_Total"] = esperado
                 df.at[idx, "Completado"]         = True
+
+        # ── Asignar semáforo ──────────────────────────────────────────────────
+        for idx in indices:
+            op = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
+            if "saldo anterior" in op:
+                df.at[idx, "Semaforo"] = "🟢"
+                continue
+
+            err_ent  = df.at[idx, "Error_Ent"]
+            err_sal  = df.at[idx, "Error_Sal"]
+            alterado = df.at[idx, "Alterado"]
+            completado = df.at[idx, "Completado"]
+
+            n_errores = sum([err_ent, err_sal, alterado])
+
+            if completado and n_errores == 0:
+                df.at[idx, "Semaforo"] = "🔵"
+            elif n_errores >= 2:
+                df.at[idx, "Semaforo"] = "⚫"
+            elif alterado:
+                df.at[idx, "Semaforo"] = "🔴"
+            elif err_ent or err_sal:
+                df.at[idx, "Semaforo"] = "🟡"
+            else:
+                df.at[idx, "Semaforo"] = "🟢"
 
     return df
 
@@ -221,31 +280,47 @@ def render_tabla(dff, mostrar_verificacion=False):
         "Saldo C.Total": lambda x: f"{x:,.2f}" if pd.notna(x) else "",
     }
 
-    if mostrar_verificacion and "Alterado" in display.columns:
-        display["Saldo Calculado"] = display["Saldo_Calculado"]
-        display["Diferencia"]      = display["Diferencia"]
-        alterado_mask              = display["Alterado"].values
-        completado_mask            = display["Completado"].values if "Completado" in display.columns else [False] * len(display)
-        display = display.drop(columns=["Saldo_Calculado", "Alterado", "Completado"], errors="ignore")
-        display = display.rename(columns=cols_rename)
-        fmt["Saldo Calculado"] = "{:,.2f}"
-        fmt["Diferencia"]      = "{:,.4f}"
+    cols_drop = ["Saldo_Calculado", "Diferencia", "Alterado", "Completado",
+                 "Error_Ent", "Error_Sal"]
 
-        def highlight_filas(row):
-            idx = display.index.get_loc(row.name)
-            if alterado_mask[idx]:
-                return ["background-color: #ffebee; color: #b71c1c"] * len(row)
-            if completado_mask[idx]:
-                return ["background-color: #e3f2fd; color: #1565c0"] * len(row)
-            return [""] * len(row)
+    if mostrar_verificacion and "Semaforo" in display.columns:
+        # Leyenda
+        st.markdown("""
+        <div style="font-size:0.82rem; margin-bottom:0.5rem; color:#555;">
+        🟢 Correcto &nbsp;|&nbsp;
+        🔵 Vacío completado automáticamente &nbsp;|&nbsp;
+        🟡 Ent. o Sal. Costo Total inconsistente &nbsp;|&nbsp;
+        🔴 Saldo Costo Total incorrecto &nbsp;|&nbsp;
+        ⚫ Múltiples campos con problemas
+        </div>
+        """, unsafe_allow_html=True)
+
+        semaforo_vals = display["Semaforo"].values
+        display = display.drop(columns=cols_drop, errors="ignore")
+        # Mover semáforo al inicio
+        sem_col = display.pop("Semaforo")
+        display.insert(0, "Estado", sem_col)
+        display = display.rename(columns=cols_rename)
+
+        color_map = {
+            "🔴": "background-color: #ffebee; color: #b71c1c",
+            "🟡": "background-color: #fffde7; color: #f57f17",
+            "⚫": "background-color: #f3e5f5; color: #4a148c",
+            "🔵": "background-color: #e3f2fd; color: #1565c0",
+            "🟢": "",
+        }
+
+        def highlight_semaforo(row):
+            idx   = display.index.get_loc(row.name)
+            estilo = color_map.get(semaforo_vals[idx], "")
+            return [estilo] * len(row)
 
         st.dataframe(
-            display.style.format(fmt).apply(highlight_filas, axis=1),
+            display.style.format(fmt).apply(highlight_semaforo, axis=1),
             use_container_width=True, height=600
         )
     else:
-        display = display.drop(columns=["Saldo_Calculado", "Diferencia", "Alterado", "Completado"],
-                               errors="ignore")
+        display = display.drop(columns=cols_drop + ["Semaforo"], errors="ignore")
         display = display.rename(columns=cols_rename)
         st.dataframe(display.style.format(fmt), use_container_width=True, height=600)
 
@@ -506,23 +581,34 @@ badges = " ".join([
 st.markdown(f'<div style="margin-bottom:1rem;">{badges}</div>', unsafe_allow_html=True)
 
 # ── Alerta de integridad ──────────────────────────────────────────────────────
-n_alterados  = df_all["Alterado"].sum()
-n_completados = df_all["Completado"].sum() if "Completado" in df_all.columns else 0
+n_alterados   = int(df_all["Alterado"].sum())  if "Alterado"   in df_all.columns else 0
+n_completados = int(df_all["Completado"].sum()) if "Completado" in df_all.columns else 0
+n_err_ent     = int(df_all["Error_Ent"].sum())  if "Error_Ent"  in df_all.columns else 0
+n_err_sal     = int(df_all["Error_Sal"].sum())  if "Error_Sal"  in df_all.columns else 0
+n_multiples   = int((df_all["Semaforo"] == "⚫").sum()) if "Semaforo" in df_all.columns else 0
 
-if n_alterados > 0 or n_completados > 0:
+hay_problemas = n_alterados > 0 or n_completados > 0 or n_err_ent > 0 or n_err_sal > 0
+
+if hay_problemas:
     msgs = []
+    if n_multiples > 0:
+        msgs.append(f"⚫ <strong>{n_multiples}</strong> fila(s) con múltiples campos incorrectos")
     if n_alterados > 0:
-        msgs.append(f"<strong>{n_alterados} fila(s) con valor incorrecto</strong> (marcadas en 🔴 rojo)")
+        msgs.append(f"🔴 <strong>{n_alterados}</strong> fila(s) con Saldo Costo Total incorrecto")
+    if n_err_ent > 0:
+        msgs.append(f"🟡 <strong>{n_err_ent}</strong> fila(s) con Entrada Costo Total inconsistente")
+    if n_err_sal > 0:
+        msgs.append(f"🟡 <strong>{n_err_sal}</strong> fila(s) con Salida Costo Total inconsistente")
     if n_completados > 0:
-        msgs.append(f"<strong>{n_completados} fila(s) con valor vacío completadas automáticamente</strong> (marcadas en 🔵 azul)")
+        msgs.append(f"🔵 <strong>{n_completados}</strong> fila(s) con valor vacío completado automáticamente")
     st.markdown(
-        f'<div class="alert-box">⚠️ Se detectaron: {" y ".join(msgs)}. '
-        f'Activa <strong>"Mostrar verificación"</strong> para ver el detalle.</div>',
+        f'<div class="alert-box">⚠️ Se detectaron anomalías:<br>{"<br>".join(msgs)}<br><br>'
+        f'Activa <strong>"Mostrar verificación"</strong> para ver el detalle fila por fila.</div>',
         unsafe_allow_html=True
     )
 else:
     st.markdown(
-        '<div class="ok-box">✅ Todos los valores de Costo Total Saldo Final coinciden con el cálculo esperado.</div>',
+        '<div class="ok-box">✅ Todos los campos verificados son correctos.</div>',
         unsafe_allow_html=True
     )
 
@@ -543,7 +629,11 @@ st.markdown('<div class="section-title">💾 Descargar datos</div>', unsafe_allo
 df_export = df_all.copy()
 if "Saldo_Calculado" in df_export.columns:
     df_export["Saldo_Costo_Total"] = df_export["Saldo_Calculado"]
-df_export = df_export.drop(columns=["Saldo_Calculado", "Diferencia", "Alterado", "Completado"], errors="ignore")
+df_export = df_export.drop(
+    columns=["Saldo_Calculado", "Diferencia", "Alterado", "Completado",
+             "Error_Ent", "Error_Sal", "Semaforo"],
+    errors="ignore"
+)
 buffer = exportar_excel(df_export)
 
 nombre_personalizado = st.text_input(
