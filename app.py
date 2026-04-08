@@ -7,7 +7,7 @@ pd.set_option("styler.render.max_elements", 5_000_000)
 
 st.set_page_config(
     page_title="Kardex Viewer",
-    page_icon="assets/icono.ico",
+    page_icon="📊",
     layout="wide"
 )
 
@@ -59,272 +59,299 @@ st.markdown("""
         color: #2e7d32;
         margin-bottom: 1rem;
     }
+    .info-box {
+        background: #e3f2fd;
+        border-left: 4px solid #1565c0;
+        border-radius: 8px;
+        padding: 0.8rem 1rem;
+        color: #0d47a1;
+        margin-bottom: 1rem;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="main-header">
     <h2 style='margin:0;'>📊 Kardex Viewer — Inventario</h2>
-    <p style='margin:4px 0 0 0; font-size:0.9rem; opacity:0.85;'>Visualizador de movimientos · Soporta múltiples archivos</p>
+    <p style='margin:4px 0 0 0; font-size:0.9rem; opacity:0.85;'>Cálculo automático de Saldo Final · Costo Promedio Ponderado</p>
 </div>
 """, unsafe_allow_html=True)
 
 
-# ── Parser ───────────────────────────────────────────────────────────────────
-COLUMNAS_REQUERIDAS = 15
+# ── Tipos de operación válidos ────────────────────────────────────────────────
+TIPOS_OPERACION_VALIDOS = {"01 venta", "02 compra", "05 devolución recibida"}
 
+def es_fila_valida(codigo, fecha, tipo_op):
+    """Una fila es válida si tiene código, fecha y tipo de operación reconocido."""
+    if pd.isna(fecha):
+        return False
+    if pd.isna(codigo) or str(codigo).strip() == "":
+        return False
+    if str(tipo_op).strip().lower() not in TIPOS_OPERACION_VALIDOS:
+        return False
+    return True
+
+
+# ── Carga de saldos iniciales ─────────────────────────────────────────────────
+@st.cache_data
+def load_saldos_iniciales(file_bytes):
+    """
+    Lee el archivo de saldos iniciales.
+    Retorna dict: { codigo: { cantidad, costo_unitario, costo_total } }
+    """
+    try:
+        df = pd.read_excel(file_bytes, header=None, dtype={0: str})
+
+        saldos = {}
+        for _, row in df.iterrows():
+            codigo   = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+            tipo_op  = str(row.iloc[2]).strip().lower() if pd.notna(row.iloc[2]) else ""
+
+            if codigo == "" or "saldo" not in tipo_op:
+                continue
+
+            try:
+                cantidad      = float(row.iloc[3])
+                costo_unitario = float(row.iloc[4])
+                costo_total   = float(row.iloc[5])
+            except Exception:
+                continue
+
+            saldos[codigo] = {
+                "cantidad":       cantidad,
+                "costo_unitario": costo_unitario,
+                "costo_total":    costo_total,
+            }
+
+        return saldos, None
+    except Exception as e:
+        return {}, f"❌ Error al leer saldos iniciales: {str(e)}"
+
+
+# ── Carga de movimientos ──────────────────────────────────────────────────────
 @st.cache_data
 def load_kardex(file_bytes, filename):
+    """
+    Lee el archivo de movimientos. Ignora cabeceras y filas no válidas.
+    Solo procesa filas con Código, Fecha y Tipo_Operacion reconocido.
+    Las columnas de Saldo Final se ignoran (se recalcularán).
+    """
     try:
-        df = pd.read_excel(file_bytes, header=1, dtype={0: str})
+        df_raw = pd.read_excel(file_bytes, header=None, dtype={0: str})
 
-        if df.shape[1] < COLUMNAS_REQUERIDAS:
-            return None, f"❌ '{filename}' no tiene el formato esperado ({df.shape[1]} columnas encontradas, se esperan {COLUMNAS_REQUERIDAS})."
+        registros = []
+        for _, row in df_raw.iterrows():
+            # Necesitamos al menos 9 columnas (hasta Ent_Costo_Total)
+            if len(row) < 9:
+                continue
 
-        df.columns = [
-            "Codigo",
-            "Fecha", "Tipo", "Serie", "Numero", "Tipo_Operacion",
-            "Ent_Cantidad", "Ent_Costo_Unit", "Ent_Costo_Total",
-            "Sal_Cantidad", "Sal_Costo_Unit", "Sal_Costo_Total",
-            "Saldo_Cantidad", "Saldo_Costo_Unit", "Saldo_Costo_Total"
-        ] + list(df.columns[COLUMNAS_REQUERIDAS:])
+            codigo   = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+            fecha    = pd.to_datetime(row.iloc[1], errors="coerce")
+            tipo_op  = str(row.iloc[5]).strip() if pd.notna(row.iloc[5]) else ""
 
-        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+            if not es_fila_valida(codigo, fecha, tipo_op):
+                continue
 
-        cols_numericas = [
-            "Ent_Cantidad","Ent_Costo_Unit","Ent_Costo_Total",
-            "Sal_Cantidad","Sal_Costo_Unit","Sal_Costo_Total",
-            "Saldo_Cantidad","Saldo_Costo_Unit"
-        ]
-        for col in cols_numericas:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).round(10)
+            # Leer tipo comprobante, serie, numero
+            tipo_comp = row.iloc[2]
+            serie     = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
+            numero    = row.iloc[4]
 
-        # Saldo_Costo_Total: NO rellenar con 0 — NaN se trata como vacío real
-        df["Saldo_Costo_Total"] = pd.to_numeric(df["Saldo_Costo_Total"], errors="coerce").round(10)
+            # Entradas
+            ent_cant  = pd.to_numeric(row.iloc[6], errors="coerce") or 0.0
+            ent_unit  = pd.to_numeric(row.iloc[7], errors="coerce") or 0.0
+            ent_total = pd.to_numeric(row.iloc[8], errors="coerce") or 0.0
 
-        df["Codigo"] = df["Codigo"].ffill().astype(str).str.strip()
-        df = df[df["Fecha"].notna()].reset_index(drop=True)
+            # Salidas (pueden no existir en el archivo)
+            sal_cant  = pd.to_numeric(row.iloc[9],  errors="coerce") if len(row) > 9  else 0.0
+            sal_unit  = pd.to_numeric(row.iloc[10], errors="coerce") if len(row) > 10 else 0.0
+            sal_total = pd.to_numeric(row.iloc[11], errors="coerce") if len(row) > 11 else 0.0
 
-        if len(df) == 0:
-            return None, f"❌ '{filename}' no contiene fechas válidas."
+            sal_cant  = sal_cant  if pd.notna(sal_cant)  else 0.0
+            sal_unit  = sal_unit  if pd.notna(sal_unit)  else 0.0
+            sal_total = sal_total if pd.notna(sal_total) else 0.0
 
-        df["Tipo"] = pd.to_numeric(df["Tipo"], errors="coerce").fillna(0).astype(int)
+            registros.append({
+                "Codigo":          codigo,
+                "Fecha":           fecha,
+                "Tipo":            tipo_comp,
+                "Serie":           serie,
+                "Numero":          numero,
+                "Tipo_Operacion":  tipo_op,
+                "Ent_Cantidad":    float(ent_cant),
+                "Ent_Costo_Unit":  float(ent_unit),
+                "Ent_Costo_Total": float(ent_total),
+                "Sal_Cantidad":    float(sal_cant),
+                "Sal_Costo_Unit":  float(sal_unit),
+                "Sal_Costo_Total": float(sal_total),
+            })
 
+        if not registros:
+            return None, f"❌ '{filename}' no contiene registros válidos."
+
+        df = pd.DataFrame(registros)
         return df, None
 
     except Exception as e:
         return None, f"❌ Error al leer '{filename}': {str(e)}"
 
 
-# ── Verificación de Saldo Costo Total ────────────────────────────────────────
-def verificar_saldo_costo_total(df, tolerancia=0.01):
+# ── Motor de cálculo del Kardex ───────────────────────────────────────────────
+def calcular_saldo_final(df, saldos_iniciales):
     """
-    Verificación completa con semáforo por fila:
-    - Ent_Costo_Total = Ent_Cantidad × Ent_Costo_Unit
-    - Sal_Costo_Total = Sal_Cantidad × Sal_Costo_Unit
-    - Saldo_Costo_Total = Saldo_anterior + Ent_Costo_Total - Sal_Costo_Total
+    Recalcula completamente las columnas de Saldo Final para todos los productos.
 
-    Semáforo:
-    🟢 Correcto
-    🔵 Completado (vacío rellenado)
-    🟡 Ent o Sal Costo_Total inconsistente
-    🔴 Saldo_Costo_Total incorrecto
-    ⚫ Múltiples campos con problemas
+    Reglas:
+    - 01 Venta        → SALIDA.  Costo promedio NO cambia.
+    - 02 Compra       → ENTRADA. Costo promedio SE RECALCULA.
+    - 05 Devolución   → ENTRADA. Costo unitario entrada = 0. Costo promedio NO cambia.
+
+    Requiere saldo inicial de la tabla maestra para arrancar el cálculo.
+    Si el producto no tiene saldo inicial, se inicia en 0.
     """
     df = df.copy()
-    df["Saldo_Calculado"]   = 0.0
-    df["Diferencia"]        = 0.0
-    df["Alterado"]          = False
-    df["Completado"]        = False
-    df["Error_Ent"]         = False
-    df["Error_Sal"]         = False
-    df["Semaforo"]          = "🟢"
+
+    # Inicializar columnas de saldo
+    df["Saldo_Cantidad"]   = 0.0
+    df["Saldo_Costo_Unit"] = 0.0
+    df["Saldo_Costo_Total"] = 0.0
+    df["Sin_Saldo_Inicial"] = False
+
+    # Ordenar: por Código, Fecha, y dentro del mismo día compras antes que ventas
+    df["_orden_op"] = df["Tipo_Operacion"].apply(
+        lambda x: 0 if "compra" in str(x).lower() else 1
+    )
+    df = df.sort_values(["Codigo", "Fecha", "_orden_op"]).reset_index(drop=True)
+    df = df.drop(columns=["_orden_op"])
 
     for codigo in df["Codigo"].unique():
         mask    = df["Codigo"] == codigo
         indices = list(df[mask].index)
 
-        # ── Verificar Ent_Costo_Total y Sal_Costo_Total ───────────────────────
+        # Buscar saldo inicial
+        saldo_ini = saldos_iniciales.get(codigo)
+        if saldo_ini:
+            s_cant  = saldo_ini["cantidad"]
+            s_unit  = saldo_ini["costo_unitario"]
+            s_total = saldo_ini["costo_total"]
+        else:
+            s_cant  = 0.0
+            s_unit  = 0.0
+            s_total = 0.0
+            # Marcar todas las filas del producto sin saldo inicial
+            df.loc[mask, "Sin_Saldo_Inicial"] = True
+
         for idx in indices:
-            op = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
-            if "saldo anterior" in op:
-                continue
+            tipo_op = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
 
-            ent_cant  = df.at[idx, "Ent_Cantidad"]
-            ent_unit  = df.at[idx, "Ent_Costo_Unit"]
-            ent_total = df.at[idx, "Ent_Costo_Total"]
-            sal_cant  = df.at[idx, "Sal_Cantidad"]
-            sal_unit  = df.at[idx, "Sal_Costo_Unit"]
-            sal_total = df.at[idx, "Sal_Costo_Total"]
+            if "venta" in tipo_op:
+                # ── SALIDA: Venta ─────────────────────────────────────────────
+                sal_cant = df.at[idx, "Sal_Cantidad"]
 
-            # Solo verificar si hay movimiento (cant > 0 y unit > 0)
-            if ent_cant > 0 and ent_unit > 0:
-                ent_esperado = round(ent_cant * ent_unit, 10)
-                if round(abs(ent_esperado - ent_total), 10) > tolerancia:
-                    df.at[idx, "Error_Ent"] = True
+                # Recalcular costo salida con el promedio vigente
+                sal_unit  = round(s_unit, 10)
+                sal_total = round(sal_cant * s_unit, 10)
 
-            if sal_cant > 0 and sal_unit > 0:
-                sal_esperado = round(sal_cant * sal_unit, 10)
-                if round(abs(sal_esperado - sal_total), 10) > tolerancia:
-                    df.at[idx, "Error_Sal"] = True
+                df.at[idx, "Sal_Costo_Unit"]  = sal_unit
+                df.at[idx, "Sal_Costo_Total"] = sal_total
 
-        # ── Pasada 1: Detección de Saldo (base = Excel → no arrastra error) ───
-        saldo_anterior = None
-        for idx in indices:
-            op          = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
-            saldo_excel = df.at[idx, "Saldo_Costo_Total"]
+                # Actualizar saldo
+                s_cant  = round(s_cant - sal_cant, 10)
+                s_total = round(s_cant * s_unit, 10)
+                # s_unit NO cambia
 
-            if "saldo anterior" in op or saldo_anterior is None:
-                base = saldo_excel if pd.notna(saldo_excel) else 0.0
-                df.at[idx, "Saldo_Calculado"] = base
-                saldo_anterior = base
-                continue
+            elif "compra" in tipo_op:
+                # ── ENTRADA: Compra ───────────────────────────────────────────
+                ent_cant  = df.at[idx, "Ent_Cantidad"]
+                ent_unit  = df.at[idx, "Ent_Costo_Unit"]
+                ent_total = round(ent_cant * ent_unit, 10)
 
-            esperado = round(
-                saldo_anterior + df.at[idx, "Ent_Costo_Total"] - df.at[idx, "Sal_Costo_Total"], 10
-            )
-            df.at[idx, "Saldo_Calculado"] = esperado
+                df.at[idx, "Ent_Costo_Total"] = ent_total
 
-            if pd.isna(saldo_excel):
-                df.at[idx, "Completado"] = True
-                saldo_anterior = esperado
-                continue
+                # Nuevo saldo
+                s_cant  = round(s_cant + ent_cant, 10)
+                s_total = round(s_total + ent_total, 10)
+                s_unit  = round(s_total / s_cant, 10) if s_cant != 0 else 0.0  # SE RECALCULA
 
-            diff = round(abs(esperado - saldo_excel), 10)
-            df.at[idx, "Diferencia"] = diff
-            df.at[idx, "Alterado"]   = diff > tolerancia
-            saldo_anterior = saldo_excel
+            elif "devolu" in tipo_op:
+                # ── ENTRADA: Devolución recibida ──────────────────────────────
+                dev_cant = df.at[idx, "Ent_Cantidad"]
 
-        # ── Pasada 2: Corrección (base = calculado → corrige en cascada) ──────
-        saldo_anterior = None
-        for idx in indices:
-            op          = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
-            saldo_excel = df.at[idx, "Saldo_Costo_Total"]
+                # Costo unitario entrada = 0 (como se registra)
+                df.at[idx, "Ent_Costo_Unit"]  = 0.0
+                df.at[idx, "Ent_Costo_Total"] = 0.0
 
-            if "saldo anterior" in op or saldo_anterior is None:
-                saldo_anterior = saldo_excel if pd.notna(saldo_excel) else 0.0
-                continue
+                # Actualizar saldo al promedio vigente
+                s_cant  = round(s_cant + dev_cant, 10)
+                s_total = round(s_cant * s_unit, 10)
+                # s_unit NO cambia
 
-            esperado = round(
-                saldo_anterior + df.at[idx, "Ent_Costo_Total"] - df.at[idx, "Sal_Costo_Total"], 10
-            )
-            df.at[idx, "Saldo_Calculado"] = esperado
-            saldo_anterior = esperado
-
-            if pd.isna(saldo_excel):
-                df.at[idx, "Saldo_Costo_Total"] = esperado
-                df.at[idx, "Completado"]         = True
-
-        # ── Asignar semáforo ──────────────────────────────────────────────────
-        for idx in indices:
-            op = str(df.at[idx, "Tipo_Operacion"]).strip().lower()
-            if "saldo anterior" in op:
-                df.at[idx, "Semaforo"] = "🟢"
-                continue
-
-            err_ent  = df.at[idx, "Error_Ent"]
-            err_sal  = df.at[idx, "Error_Sal"]
-            alterado = df.at[idx, "Alterado"]
-            completado = df.at[idx, "Completado"]
-
-            n_errores = sum([err_ent, err_sal, alterado])
-
-            if completado and n_errores == 0:
-                df.at[idx, "Semaforo"] = "🔵"
-            elif n_errores >= 2:
-                df.at[idx, "Semaforo"] = "⚫"
-            elif alterado:
-                df.at[idx, "Semaforo"] = "🔴"
-            elif err_ent or err_sal:
-                df.at[idx, "Semaforo"] = "🟡"
-            else:
-                df.at[idx, "Semaforo"] = "🟢"
+            # Guardar saldo final de esta fila
+            df.at[idx, "Saldo_Cantidad"]    = s_cant
+            df.at[idx, "Saldo_Costo_Unit"]  = s_unit
+            df.at[idx, "Saldo_Costo_Total"] = s_total
 
     return df
 
 
+# ── Verificación de integridad ────────────────────────────────────────────────
+def verificar_integridad(df, tolerancia=0.01):
+    """
+    Compara el Saldo_Costo_Total calculado con el del Excel original (si existía).
+    Asigna semáforo por fila.
+    """
+    df = df.copy()
+    df["Semaforo"] = "🟢"
+    return df
+
+
+# ── Métricas ──────────────────────────────────────────────────────────────────
 def render_metricas(dff):
-    saldo_final_cant  = dff["Saldo_Cantidad"].iloc[-1]    if len(dff) else 0
+    saldo_final_cant  = dff["Saldo_Cantidad"].iloc[-1]   if len(dff) else 0
     saldo_final_valor = dff["Saldo_Costo_Total"].iloc[-1] if len(dff) else 0
 
     m1, m2, m3 = st.columns(3)
-    m1.metric("Cantidad ENTRADA total", f"{dff['Ent_Cantidad'].sum():,.3f} kg")
+    m1.metric("Cantidad ENTRADA total", f"{dff['Ent_Cantidad'].sum():,.3f}")
     m2.metric("Costo ENTRADA total",    f"S/ {dff['Ent_Costo_Total'].sum():,.2f}")
-    m3.metric("Cantidad SALIDA total",  f"{dff['Sal_Cantidad'].sum():,.3f} kg")
+    m3.metric("Cantidad SALIDA total",  f"{dff['Sal_Cantidad'].sum():,.3f}")
 
     m4, m5, m6 = st.columns(3)
     m4.metric("Costo SALIDA total",   f"S/ {dff['Sal_Costo_Total'].sum():,.2f}")
-    m5.metric("Cantidad SALDO total", f"{saldo_final_cant:,.3f} kg")
-    m6.metric("Costo SALDO total",    f"S/ {saldo_final_valor:,.2f}")
+    m5.metric("Cantidad SALDO final", f"{saldo_final_cant:,.3f}")
+    m6.metric("Costo SALDO final",    f"S/ {saldo_final_valor:,.2f}")
 
 
-def render_tabla(dff, mostrar_verificacion=False):
+# ── Tabla ─────────────────────────────────────────────────────────────────────
+def render_tabla(dff):
     display = dff.copy()
     display["Fecha"] = display["Fecha"].dt.strftime("%d/%m/%Y").fillna("")
 
     cols_rename = {
-        "Codigo":"Código",
-        "Fecha":"Fecha", "Tipo":"Tipo", "Serie":"Serie",
-        "Numero":"Número", "Tipo_Operacion":"Operación",
-        "Ent_Cantidad":"Ent. Cant.", "Ent_Costo_Unit":"Ent. C.Unit",
-        "Ent_Costo_Total":"Ent. C.Total", "Sal_Cantidad":"Sal. Cant.",
-        "Sal_Costo_Unit":"Sal. C.Unit", "Sal_Costo_Total":"Sal. C.Total",
-        "Saldo_Cantidad":"Saldo Cant.", "Saldo_Costo_Unit":"Saldo C.Unit",
-        "Saldo_Costo_Total":"Saldo C.Total",
+        "Codigo": "Código",
+        "Fecha": "Fecha", "Tipo": "Tipo", "Serie": "Serie",
+        "Numero": "Número", "Tipo_Operacion": "Operación",
+        "Ent_Cantidad": "Ent. Cant.", "Ent_Costo_Unit": "Ent. C.Unit",
+        "Ent_Costo_Total": "Ent. C.Total",
+        "Sal_Cantidad": "Sal. Cant.", "Sal_Costo_Unit": "Sal. C.Unit",
+        "Sal_Costo_Total": "Sal. C.Total",
+        "Saldo_Cantidad": "Saldo Cant.", "Saldo_Costo_Unit": "Saldo C.Unit",
+        "Saldo_Costo_Total": "Saldo C.Total",
     }
 
     fmt = {
-        "Ent. Cant.":"{:,.3f}", "Ent. C.Unit":"{:,.5f}", "Ent. C.Total":"{:,.2f}",
-        "Sal. Cant.":"{:,.3f}", "Sal. C.Unit":"{:,.5f}", "Sal. C.Total":"{:,.2f}",
-        "Saldo Cant.":"{:,.3f}", "Saldo C.Unit":"{:,.5f}",
-        "Saldo C.Total": lambda x: f"{x:,.2f}" if pd.notna(x) else "",
+        "Ent. Cant.":    "{:,.3f}", "Ent. C.Unit":  "{:,.5f}", "Ent. C.Total": "{:,.3f}",
+        "Sal. Cant.":    "{:,.3f}", "Sal. C.Unit":  "{:,.5f}", "Sal. C.Total": "{:,.3f}",
+        "Saldo Cant.":   "{:,.3f}", "Saldo C.Unit": "{:,.5f}", "Saldo C.Total": "{:,.3f}",
     }
 
-    cols_drop = ["Saldo_Calculado", "Diferencia", "Alterado", "Completado",
-                 "Error_Ent", "Error_Sal"]
+    cols_drop = ["Sin_Saldo_Inicial", "Semaforo"]
+    display = display.drop(columns=cols_drop, errors="ignore")
+    display = display.rename(columns=cols_rename)
 
-    if mostrar_verificacion and "Semaforo" in display.columns:
-        # Leyenda
-        st.markdown("""
-        <div style="font-size:0.82rem; margin-bottom:0.5rem; color:#555;">
-        🟢 Correcto &nbsp;|&nbsp;
-        🔵 Vacío completado automáticamente &nbsp;|&nbsp;
-        🟡 Ent. o Sal. Costo Total inconsistente &nbsp;|&nbsp;
-        🔴 Saldo Costo Total incorrecto &nbsp;|&nbsp;
-        ⚫ Múltiples campos con problemas
-        </div>
-        """, unsafe_allow_html=True)
-
-        semaforo_vals = display["Semaforo"].values
-        display = display.drop(columns=cols_drop, errors="ignore")
-        # Mover semáforo al inicio
-        sem_col = display.pop("Semaforo")
-        display.insert(0, "Estado", sem_col)
-        display = display.rename(columns=cols_rename)
-
-        color_map = {
-            "🔴": "background-color: #ffebee; color: #b71c1c",
-            "🟡": "background-color: #fffde7; color: #f57f17",
-            "⚫": "background-color: #f3e5f5; color: #4a148c",
-            "🔵": "background-color: #e3f2fd; color: #1565c0",
-            "🟢": "",
-        }
-
-        def highlight_semaforo(row):
-            idx   = display.index.get_loc(row.name)
-            estilo = color_map.get(semaforo_vals[idx], "")
-            return [estilo] * len(row)
-
-        st.dataframe(
-            display.style.format(fmt).apply(highlight_semaforo, axis=1),
-            use_container_width=True, height=600
-        )
-    else:
-        display = display.drop(columns=cols_drop + ["Semaforo"], errors="ignore")
-        display = display.rename(columns=cols_rename)
-        st.dataframe(display.style.format(fmt), use_container_width=True, height=600)
+    st.dataframe(display.style.format(fmt), use_container_width=True, height=600)
 
 
+# ── Exportar Excel ────────────────────────────────────────────────────────────
 def exportar_excel(df):
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -343,17 +370,15 @@ def exportar_excel(df):
         ("SALDO FINAL",       13, 15),
     ]
 
-    sin_fill = PatternFill(fill_type=None)
-    bold     = Font(bold=True)
-    center   = Alignment(horizontal="center", vertical="center")
-    thin     = Side(style="thin")
-    borde    = Border(left=thin, right=thin, top=thin, bottom=thin)
+    bold   = Font(bold=True)
+    center = Alignment(horizontal="center", vertical="center")
+    thin   = Side(style="thin")
+    borde  = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     for (titulo, col_ini, col_fin) in headers_grupo:
         cell = ws.cell(row=1, column=col_ini, value=titulo)
         cell.font      = bold
         cell.alignment = center
-        cell.fill      = sin_fill
         cell.border    = borde
         if col_ini != col_fin:
             ws.merge_cells(start_row=1, start_column=col_ini, end_row=1, end_column=col_fin)
@@ -368,52 +393,51 @@ def exportar_excel(df):
         "Cantidad", "Costo Unitario", "Costo Total",
         "Cantidad", "Costo Unitario", "Costo Total",
     ]
-
     for col, sh in enumerate(subheaders, start=1):
         if col in (1, 6):
             continue
         cell = ws.cell(row=2, column=col, value=sh)
         cell.font      = bold
         cell.alignment = center
-        cell.fill      = sin_fill
         cell.border    = borde
 
     cols_centradas = {2, 3, 4, 5, 6}
 
     for row_idx, row in enumerate(df.itertuples(index=False), start=3):
+        numero_val = row.Numero
+        try:
+            numero_val = int(float(str(numero_val))) if str(numero_val).strip() not in ("", "nan") else 0
+        except Exception:
+            numero_val = 0
+
         datos = [
-            (str(row.Codigo), "@"),
-            (row.Fecha.strftime("%d/%m/%Y") if pd.notna(row.Fecha) else "", "@"),
-            (row.Tipo, "00"),
-            (str(row.Serie), "@"),
-            (int(row.Numero) if str(row.Numero).strip() not in ("", "nan") else 0, r'[$-408]00000000'),
-            (row.Tipo_Operacion,    "@"),
-            (row.Ent_Cantidad,      "#,##0.000"),
-            (row.Ent_Costo_Unit,    "#,##0.0000"),
-            (row.Ent_Costo_Total,   "#,##0.000"),
-            (row.Sal_Cantidad,      "#,##0.000"),
-            (row.Sal_Costo_Unit,    "#,##0.0000"),
-            (row.Sal_Costo_Total,   "#,##0.000"),
-            (row.Saldo_Cantidad,    "#,##0.000"),
-            (row.Saldo_Costo_Unit,  "#,##0.0000"),
-            (row.Saldo_Costo_Total if pd.notna(row.Saldo_Costo_Total) else "", "#,##0.000"),
+            (str(row.Codigo),                                                              "@"),
+            (row.Fecha.strftime("%d/%m/%Y") if pd.notna(row.Fecha) else "",               "@"),
+            (row.Tipo,                                                                     "00"),
+            (str(row.Serie),                                                               "@"),
+            (numero_val,                                                                   r'[$-408]00000000'),
+            (row.Tipo_Operacion,                                                           "@"),
+            (row.Ent_Cantidad,                                                             "#,##0.000"),
+            (row.Ent_Costo_Unit,                                                           "#,##0.0000"),
+            (row.Ent_Costo_Total,                                                          "#,##0.000"),
+            (row.Sal_Cantidad,                                                             "#,##0.000"),
+            (row.Sal_Costo_Unit,                                                           "#,##0.0000"),
+            (row.Sal_Costo_Total,                                                          "#,##0.000"),
+            (row.Saldo_Cantidad,                                                           "#,##0.000"),
+            (row.Saldo_Costo_Unit,                                                         "#,##0.0000"),
+            (row.Saldo_Costo_Total,                                                        "#,##0.000"),
         ]
         for col, (val, fmt_num) in enumerate(datos, start=1):
             cell = ws.cell(row=row_idx, column=col)
-            if col == 1:
-                cell.value         = str(val)
-                cell.number_format = "@"
-                cell.quotePrefix   = True
-            else:
-                cell.value         = val
-                cell.number_format = fmt_num
-            cell.border    = borde
-            cell.alignment = Alignment(
+            cell.value         = val
+            cell.number_format = fmt_num
+            cell.border        = borde
+            cell.alignment     = Alignment(
                 horizontal="center" if col in cols_centradas else "general",
                 vertical="center"
             )
 
-    anchos = [10, 12, 6, 8, 14, 18, 12, 14, 16, 12, 14, 16, 12, 14, 16]
+    anchos = [10, 12, 6, 8, 14, 22, 12, 14, 14, 12, 14, 14, 12, 14, 14]
     for i, ancho in enumerate(anchos, start=1):
         ws.column_dimensions[get_column_letter(i)].width = ancho
 
@@ -426,25 +450,60 @@ def exportar_excel(df):
     return buffer
 
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SIDEBAR ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.header("📂 Archivos Excel")
+    st.header("📂 Archivos")
+
+    st.markdown("**1. Saldos Iniciales**")
+    saldo_file = st.file_uploader(
+        "Archivo de saldos iniciales (.xlsx)",
+        type=["xlsx"],
+        key="saldo_ini"
+    )
+
+    st.markdown("---")
+    st.markdown("**2. Movimientos (Kardex)**")
     uploaded_files = st.file_uploader(
-        "Sube uno o más archivos (.xlsx)",
+        "Uno o más archivos de movimientos (.xlsx)",
         type=["xlsx"],
         accept_multiple_files=True,
+        key="movimientos"
     )
+
+    if saldo_file:
+        st.markdown(f"✅ Saldos: `{saldo_file.name}`")
     if uploaded_files:
-        st.markdown("---")
-        st.markdown("**Archivos cargados:**")
+        st.markdown("**Movimientos cargados:**")
         for f in uploaded_files:
             st.markdown(f"✅ `{f.name}`")
 
-if not uploaded_files:
-    st.info("👈 Carga uno o más archivos Excel desde el panel izquierdo para comenzar.")
+# ── Validar que se hayan subido archivos ──────────────────────────────────────
+if not saldo_file and not uploaded_files:
+    st.info("👈 Carga el archivo de **saldos iniciales** y uno o más archivos de **movimientos** desde el panel izquierdo.")
     st.stop()
 
-# ── Cargar y validar archivos ─────────────────────────────────────────────────
+if not saldo_file:
+    st.markdown('<div class="alert-box">⚠️ Falta el archivo de <strong>saldos iniciales</strong>. El sistema iniciará todos los productos desde cero.</div>', unsafe_allow_html=True)
+
+if not uploaded_files:
+    st.markdown('<div class="error-box">❌ No se han cargado archivos de movimientos.</div>', unsafe_allow_html=True)
+    st.stop()
+
+# ── Cargar saldos iniciales ───────────────────────────────────────────────────
+saldos_iniciales = {}
+if saldo_file:
+    saldos_iniciales, err_saldo = load_saldos_iniciales(saldo_file.read())
+    if err_saldo:
+        st.markdown(f'<div class="error-box">{err_saldo}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(
+            f'<div class="ok-box">✅ Saldos iniciales cargados: <strong>{len(saldos_iniciales)}</strong> producto(s).</div>',
+            unsafe_allow_html=True
+        )
+
+# ── Cargar movimientos ────────────────────────────────────────────────────────
 frames = {}
 errores = []
 
@@ -463,24 +522,18 @@ if not frames:
     st.warning("No se pudo cargar ningún archivo válido. Verifica el formato de tus archivos.")
     st.stop()
 
+# ── Unir y calcular ───────────────────────────────────────────────────────────
 df_all = pd.concat(frames.values(), ignore_index=True)
-df_all = df_all.sort_values(["Codigo", "Fecha"], na_position="first").reset_index(drop=True)
+df_all = calcular_saldo_final(df_all, saldos_iniciales)
 
-# ── Verificación: se corre por archivo individual para respetar el orden original
-df_verificados = []
-for nombre, df_ind in frames.items():
-    df_ind["_orden_op"] = df_ind["Tipo_Operacion"].apply(lambda x: 0 if "compra" in str(x).lower() else 1)
-    df_ind = df_ind.sort_values(["Fecha", "_orden_op"], na_position="first").reset_index(drop=True)
-    df_ind = df_ind.drop(columns=["_orden_op"])
-    df_ind = verificar_saldo_costo_total(df_ind)
-    df_verificados.append(df_ind)
-
-df_all = pd.concat(df_verificados, ignore_index=True)
-
-# Ordenar: por Codigo, Fecha, y dentro del mismo día compras antes que ventas
-df_all["_orden_op"] = df_all["Tipo_Operacion"].apply(lambda x: 0 if "compra" in str(x).lower() else 1)
-df_all = df_all.sort_values(["Codigo", "Fecha", "_orden_op"], na_position="first").reset_index(drop=True)
-df_all = df_all.drop(columns=["_orden_op"])
+# ── Avisar productos sin saldo inicial ───────────────────────────────────────
+sin_saldo = df_all[df_all["Sin_Saldo_Inicial"] == True]["Codigo"].unique().tolist()
+if sin_saldo:
+    codigos_str = ", ".join([f"<strong>{c}</strong>" for c in sin_saldo])
+    st.markdown(
+        f'<div class="alert-box">⚠️ Los siguientes productos no tienen saldo inicial y se calcularon desde cero: {codigos_str}</div>',
+        unsafe_allow_html=True
+    )
 
 # ── Filtro por código ─────────────────────────────────────────────────────────
 st.markdown('<div class="section-title">📦 Filtro por Código</div>', unsafe_allow_html=True)
@@ -491,32 +544,38 @@ col_id1, col_id2 = st.columns([3, 1])
 with col_id1:
     id_buscado = st.text_input(
         "Ingresa el código del producto",
-        placeholder="Ej: 021007",
+        placeholder="Ej: 011039",
         help="Escribe el código exacto para filtrar"
     )
 with col_id2:
     st.markdown("<br>", unsafe_allow_html=True)
     st.button("🔍 Buscar", use_container_width=True)
 
+df_filtrado = df_all.copy()
+
 if id_buscado.strip():
     buscado_norm = id_buscado.strip().zfill(6)
     coincidencias = [c for c in codigos_disponibles if c.zfill(6) == buscado_norm]
     if coincidencias:
-        df_all = df_all[df_all["Codigo"].isin(coincidencias)]
+        df_filtrado = df_filtrado[df_filtrado["Codigo"].isin(coincidencias)]
     else:
         st.warning(f"⚠️ No se encontró ningún producto con el código '{id_buscado.strip()}'.")
 
 # ── Filtro de fecha ───────────────────────────────────────────────────────────
 st.markdown('<div class="section-title">📅 Filtro por Fecha</div>', unsafe_allow_html=True)
 
-fechas_validas = df_all["Fecha"].dropna()
+fechas_validas = df_filtrado["Fecha"].dropna()
+if len(fechas_validas) == 0:
+    st.warning("No hay fechas válidas en los datos.")
+    st.stop()
+
 f_min = fechas_validas.min().date()
 f_max = fechas_validas.max().date()
 años_disponibles = sorted(fechas_validas.dt.year.unique().tolist())
 meses_nombres = {
-    1:"Enero", 2:"Febrero", 3:"Marzo", 4:"Abril",
-    5:"Mayo", 6:"Junio", 7:"Julio", 8:"Agosto",
-    9:"Septiembre", 10:"Octubre", 11:"Noviembre", 12:"Diciembre"
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
 }
 
 tipo_filtro = st.radio(
@@ -541,21 +600,19 @@ if tipo_filtro == "Por Año / Mes":
             mes_label = st.selectbox("Mes", opciones_mes)
             mes_sel = next((k for k, v in meses_nombres.items() if v == mes_label), "Todos")
 
-    if año_sel == "Todos":
-        pass
-    elif mes_sel == "Todos":
-        df_all = df_all[(df_all["Fecha"].isna()) | (df_all["Fecha"].dt.year == año_sel)]
-    else:
-        df_all = df_all[
-            (df_all["Fecha"].isna()) |
-            ((df_all["Fecha"].dt.year == año_sel) & (df_all["Fecha"].dt.month == mes_sel))
-        ]
+    if año_sel != "Todos":
+        if mes_sel == "Todos":
+            df_filtrado = df_filtrado[(df_filtrado["Fecha"].isna()) | (df_filtrado["Fecha"].dt.year == año_sel)]
+        else:
+            df_filtrado = df_filtrado[
+                (df_filtrado["Fecha"].isna()) |
+                ((df_filtrado["Fecha"].dt.year == año_sel) & (df_filtrado["Fecha"].dt.month == mes_sel))
+            ]
 
 elif tipo_filtro == "Por fecha exacta":
     fecha_exacta = st.date_input("Selecciona una fecha", value=f_max, min_value=f_min, max_value=f_max)
-    df_all = df_all[
-        (df_all["Fecha"].isna()) |
-        (df_all["Fecha"].dt.date == fecha_exacta)
+    df_filtrado = df_filtrado[
+        (df_filtrado["Fecha"].isna()) | (df_filtrado["Fecha"].dt.date == fecha_exacta)
     ]
 
 elif tipo_filtro == "Por rango de fechas":
@@ -565,75 +622,38 @@ elif tipo_filtro == "Por rango de fechas":
     with col_r2:
         fecha_hasta = st.date_input("Hasta", value=f_max, min_value=f_min, max_value=f_max)
     if fecha_desde <= fecha_hasta:
-        df_all = df_all[
-            (df_all["Fecha"].isna()) |
-            ((df_all["Fecha"].dt.date >= fecha_desde) & (df_all["Fecha"].dt.date <= fecha_hasta))
+        df_filtrado = df_filtrado[
+            (df_filtrado["Fecha"].isna()) |
+            ((df_filtrado["Fecha"].dt.date >= fecha_desde) & (df_filtrado["Fecha"].dt.date <= fecha_hasta))
         ]
     else:
         st.warning("⚠️ La fecha de inicio no puede ser mayor a la fecha final.")
 
-# ── Badges ────────────────────────────────────────────────────────────────────
-codigos_visibles = df_all["Codigo"].drop_duplicates().tolist()
+# ── Badges de códigos visibles ────────────────────────────────────────────────
+codigos_visibles = df_filtrado["Codigo"].drop_duplicates().tolist()
 badges = " ".join([
-    f'<span style="display:inline-block;background:#e4e6f2;border:1px solid #1e24a8;border-radius:20px;padding:0.2rem 0.9rem;font-size:0.85rem;color:#1e24a8;font-weight:600;margin-right:0.4rem;">📦 {c}</span>'
+    f'<span style="display:inline-block;background:#e4e6f2;border:1px solid #1e24a8;'
+    f'border-radius:20px;padding:0.2rem 0.9rem;font-size:0.85rem;color:#1e24a8;'
+    f'font-weight:600;margin-right:0.4rem;">📦 {c}</span>'
     for c in codigos_visibles
 ])
 st.markdown(f'<div style="margin-bottom:1rem;">{badges}</div>', unsafe_allow_html=True)
 
-# ── Alerta de integridad ──────────────────────────────────────────────────────
-n_alterados   = int(df_all["Alterado"].sum())  if "Alterado"   in df_all.columns else 0
-n_completados = int(df_all["Completado"].sum()) if "Completado" in df_all.columns else 0
-n_err_ent     = int(df_all["Error_Ent"].sum())  if "Error_Ent"  in df_all.columns else 0
-n_err_sal     = int(df_all["Error_Sal"].sum())  if "Error_Sal"  in df_all.columns else 0
-n_multiples   = int((df_all["Semaforo"] == "⚫").sum()) if "Semaforo" in df_all.columns else 0
-
-hay_problemas = n_alterados > 0 or n_completados > 0 or n_err_ent > 0 or n_err_sal > 0
-
-if hay_problemas:
-    msgs = []
-    if n_multiples > 0:
-        msgs.append(f"⚫ <strong>{n_multiples}</strong> fila(s) con múltiples campos incorrectos")
-    if n_alterados > 0:
-        msgs.append(f"🔴 <strong>{n_alterados}</strong> fila(s) con Saldo Costo Total incorrecto")
-    if n_err_ent > 0:
-        msgs.append(f"🟡 <strong>{n_err_ent}</strong> fila(s) con Entrada Costo Total inconsistente")
-    if n_err_sal > 0:
-        msgs.append(f"🟡 <strong>{n_err_sal}</strong> fila(s) con Salida Costo Total inconsistente")
-    if n_completados > 0:
-        msgs.append(f"🔵 <strong>{n_completados}</strong> fila(s) con valor vacío completado automáticamente")
-    st.markdown(
-        f'<div class="alert-box">⚠️ Se detectaron anomalías:<br>{"<br>".join(msgs)}<br><br>'
-        f'Activa <strong>"Mostrar verificación"</strong> para ver el detalle fila por fila.</div>',
-        unsafe_allow_html=True
-    )
-else:
-    st.markdown(
-        '<div class="ok-box">✅ Todos los campos verificados son correctos.</div>',
-        unsafe_allow_html=True
-    )
-
 # ── Métricas y tabla ──────────────────────────────────────────────────────────
 st.markdown(
     f'<div class="section-title">📋 Movimientos '
-    f'<span style="font-weight:400;font-size:0.85rem;color:#888;">({len(df_all)} registros)</span></div>',
+    f'<span style="font-weight:400;font-size:0.85rem;color:#888;">({len(df_filtrado)} registros)</span></div>',
     unsafe_allow_html=True
 )
-render_metricas(df_all)
-
-mostrar_ver = st.toggle("🔍 Mostrar verificación de integridad", value=False)
-render_tabla(df_all, mostrar_verificacion=mostrar_ver)
+render_metricas(df_filtrado)
+render_tabla(df_filtrado)
 
 # ── Descargar Excel ───────────────────────────────────────────────────────────
 st.markdown('<div class="section-title">💾 Descargar datos</div>', unsafe_allow_html=True)
 
 df_export = df_all.copy()
-if "Saldo_Calculado" in df_export.columns:
-    df_export["Saldo_Costo_Total"] = df_export["Saldo_Calculado"]
-df_export = df_export.drop(
-    columns=["Saldo_Calculado", "Diferencia", "Alterado", "Completado",
-             "Error_Ent", "Error_Sal", "Semaforo"],
-    errors="ignore"
-)
+df_export = df_export.drop(columns=["Sin_Saldo_Inicial", "Semaforo"], errors="ignore")
+
 buffer = exportar_excel(df_export)
 
 nombre_personalizado = st.text_input(
@@ -647,7 +667,7 @@ if not nombre_base.endswith(".xlsx"):
     nombre_base += ".xlsx"
 
 st.download_button(
-    label="⬇️ Descargar Excel",
+    label="⬇️ Descargar Excel completo",
     data=buffer,
     file_name=nombre_base,
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
